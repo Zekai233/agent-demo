@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from agent_runtime import AgentRuntime, SYSTEM_PROMPT_TEMPLATE
-from tools import ToolRegistry, tool
+from tool_registry import ToolRegistry, tool
 
 
 def _make_llm(responses):

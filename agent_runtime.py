@@ -9,7 +9,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from llm_client import LLMClient
-from tools import ToolRegistry
+from tool_registry import ToolRegistry
 
 # trace 日志：记录每次工具调用的输入输出
 logger = logging.getLogger("agent_runtime")

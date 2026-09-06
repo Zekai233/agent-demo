@@ -2,7 +2,7 @@
 
 import unittest
 
-from tools import ToolRegistry, tool
+from tool_registry import ToolRegistry, tool
 
 
 class TestToolRegistry(unittest.TestCase):
