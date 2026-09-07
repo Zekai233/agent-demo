@@ -41,12 +41,25 @@ class FatalError(Exception):
 # 同一工具连续报错达到该次数时，注入致歉提示并终止
 MAX_CONSECUTIVE_TOOL_ERRORS = 2
 
+# 上下文管理配置
+# 上下文总长度（字符数）超过该阈值时触发压缩
+MAX_CONTEXT_CHARS = 4000
+# 压缩时保留的最近消息条数（按 user/assistant 配对保留最近几轮）
+KEEP_RECENT_MESSAGES = 4
+
 # 友好降级提示文案
 _FALLBACK_MESSAGES = {
     "llm": "抱歉，系统暂时无法连接服务器，请稍后再试。",
     "parse": "抱歉，模型暂时无法理解该问题，请换个方式描述后再试。",
     "unknown": "抱歉，系统出现内部错误，请稍后再试。",
 }
+
+# 摘要专用提示词：让 LLM 把老旧历史压缩为摘要
+_SUMMARIZE_PROMPT = (
+    "请将以下对话历史压缩成一段简洁的摘要，保留关键事实、用户意图、"
+    "以及所有工具调用及其结果，去掉冗余的思考细节。直接输出摘要文本，不要输出其他内容。\n\n"
+    "对话历史：\n{history}"
+)
 
 
 # ReAct 系统提示词模板，要求 LLM 强制输出 JSON
@@ -79,6 +92,8 @@ class AgentRuntime:
         registry: ToolRegistry,
         max_iterations: int = 10,
         session_manager: Optional[SessionManager] = None,
+        max_context_chars: int = MAX_CONTEXT_CHARS,
+        keep_recent_messages: int = KEEP_RECENT_MESSAGES,
     ) -> None:
         """
         参数:
@@ -86,11 +101,15 @@ class AgentRuntime:
             registry: 工具注册表。
             max_iterations: 最大循环次数，防止死循环。
             session_manager: 会话管理器；缺省时自动创建，用于多用户窗口隔离。
+            max_context_chars: 上下文长度阈值（字符），超限触发压缩。
+            keep_recent_messages: 压缩时保留的最近消息条数。
         """
         self.llm = llm
         self.registry = registry
         self.max_iterations = max_iterations
         self.session_manager = session_manager or SessionManager()
+        self.max_context_chars = max_context_chars
+        self.keep_recent_messages = keep_recent_messages
 
     def _build_system_prompt(self) -> str:
         tools_schema = json.dumps(
@@ -131,6 +150,9 @@ class AgentRuntime:
         try:
             for iteration in range(1, self.max_iterations + 1):
                 logger.info(f"[Agent] 第 {iteration} 轮思考")
+
+                # --- 上下文压缩：过长时将早期历史总结为摘要 ---
+                messages = self._maybe_compress(messages)
 
                 # --- 不可恢复错误：LLM 调用失败（API 失效/网络超时等） ---
                 try:
@@ -217,9 +239,13 @@ class AgentRuntime:
                     )
                     self._sync_session(session, messages)
 
-            # 达到最大循环次数仍未结束
-            logger.warning(f"[Agent] 达到最大循环次数 {self.max_iterations}，强制终止")
-            return "抱歉，我在处理你的问题时超过了最大循环次数，请稍后再试。"
+            # 达到最大循环次数仍未结束：尝试让 LLM 给出最终答复
+            logger.warning(f"[Agent] 达到最大循环次数 {self.max_iterations}，请求 LLM 生成最终答复")
+            answer = self._finalize(messages, system_prompt)
+            if session is not None:
+                session.add_message("user", user_query)
+                session.add_message("assistant", answer)
+            return answer
 
         except FatalError as exc:
             # 不可恢复错误：Runtime 层统一降级处理
@@ -249,6 +275,74 @@ class AgentRuntime:
         """将最新 messages 状态同步写回 session。"""
         if session is not None:
             session.messages = list(messages)
+
+    def _maybe_compress(self, messages: list) -> list:
+        """当上下文总长度超过阈值时，压缩早期历史为摘要。
+
+        保留最近 keep_recent_messages 条消息，将更早的历史交给 LLM 总结成摘要，
+        用一条 system 消息（摘要）替代老旧记录，以节省 token。
+        """
+        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        if total_chars <= self.max_context_chars:
+            return messages
+
+        if len(messages) <= self.keep_recent_messages:
+            # 消息太少无需压缩
+            return messages
+
+        # 拆分：老旧历史 + 最近保留部分
+        keep_part = messages[-self.keep_recent_messages :]
+        old_part = messages[: -self.keep_recent_messages]
+
+        summary = self._summarize(old_part)
+        logger.info(
+            f"[Context] 上下文过长（{total_chars} 字符），已压缩 {len(old_part)} 条旧消息为摘要"
+        )
+
+        # 用摘要消息替代旧历史，保留最近几轮（含工具结果）
+        compressed = [
+            {"role": "system", "content": f"以下是之前对话的摘要：\n{summary}"}
+        ]
+        compressed.extend(keep_part)
+        return compressed
+
+    def _summarize(self, old_messages: list) -> str:
+        """调用 LLM 将旧历史总结为摘要；失败时退化为简单截断。"""
+        history_text = "\n".join(
+            f"{m.get('role', '')}: {m.get('content', '')}" for m in old_messages
+        )
+        prompt = _SUMMARIZE_PROMPT.format(history=history_text)
+        try:
+            summary = self.llm.chat(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt="你是一个对话摘要助手。",
+            )
+            return summary.strip()
+        except Exception as exc:  # noqa: BLE001
+            # 摘要失败时退化为截断最近内容，保证流程不中断
+            logger.warning(f"[Context] 摘要生成失败，退化为截断: {exc}")
+            return history_text[-500:]
+
+    def _finalize(self, messages: list, system_prompt: str) -> str:
+        """在达到最大轮次后，请求 LLM 基于现有上下文给出最终答复。"""
+        finalize_prompt = (
+            "由于步骤过多，请基于以上对话和工具执行结果，"
+            "直接给出你对用户问题的最终答复。"
+        )
+        try:
+            raw = self.llm.chat(
+                messages=messages + [{"role": "user", "content": finalize_prompt}],
+                system_prompt=system_prompt,
+            )
+            # 尝试解析出 final_answer 字段；失败则直接返回原始文本
+            try:
+                parsed = self._parse_output(raw)
+                return parsed.get("final_answer") or raw
+            except Exception:  # noqa: BLE001
+                return raw
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"[Finalize] 生成最终答复失败: {exc}")
+            return "抱歉，我在处理你的问题时超过了最大循环次数，请稍后再试。"
 
     def _execute_tool(self, tool_name: str, action_input: Any) -> Any:
         """执行工具并记录 trace 日志。"""

@@ -96,15 +96,16 @@ class TestAgentRuntime(unittest.TestCase):
         self.assertIn("执行出错", joined)
 
     def test_max_iterations_stop(self):
-        # LLM 永远要求调用工具，应被 max_iterations 截断
+        # LLM 永远要求调用工具，应被 max_iterations 截断，并触发最终答复
         llm = _make_llm(
-            ['{"thought": "x", "action": "add", "action_input": {"a":1,"b":1}, "final_answer": null}']
-            * 10
+            ['{"thought": "x", "action": "add", "action_input": {"a":1,"b":1}, "final_answer": null}'] * 3
+            + ['{"thought": "x", "action": "final_answer", "action_input": null, "final_answer": "已超过轮次，给出最终答案"}']
         )
         agent = AgentRuntime(llm, self.registry, max_iterations=3)
         result = agent.run("循环")
-        self.assertIn("最大循环次数", result)
-        self.assertEqual(llm.chat.call_count, 3)
+        # 主循环 3 次 + 最终答复 1 次
+        self.assertEqual(llm.chat.call_count, 4)
+        self.assertEqual(result, "已超过轮次，给出最终答案")
 
     def test_empty_action_prompted(self):
         llm = _make_llm(
@@ -268,6 +269,121 @@ class TestErrorHandling(unittest.TestCase):
         agent = AgentRuntime(llm, self.registry)
         result = agent.run("你好", session_id="s1")
         self.assertIn("换个方式描述", result)
+
+
+class TestContextManagement(unittest.TestCase):
+    def setUp(self):
+        self.registry = ToolRegistry()
+
+        @tool(
+            self.registry,
+            description="计算两个数的和",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "a": {"type": "number"},
+                    "b": {"type": "number"},
+                },
+                "required": ["a", "b"],
+            },
+        )
+        def add(a, b):
+            return a + b
+
+    def test_max_iterations_gives_final_answer(self):
+        """达到最大轮次后，应调用 LLM 生成最终答复而非硬编码文本。"""
+        # 前两次调用工具，第三次用于 _finalize
+        llm = _make_llm(
+            [
+                '{"thought": "t", "action": "add", "action_input": {"a":1,"b":1}, "final_answer": null}',
+                '{"thought": "t", "action": "add", "action_input": {"a":2,"b":2}, "final_answer": null}',
+                '{"thought": "t", "action": "final_answer", "action_input": null, "final_answer": "总结性答案"}',
+            ]
+        )
+        agent = AgentRuntime(llm, self.registry, max_iterations=2)
+        result = agent.run("计算", session_id="s1")
+        self.assertEqual(result, "总结性答案")
+
+    def test_compress_when_too_long(self):
+        """上下文过长时应触发压缩，用摘要替代旧历史并保留最近消息。"""
+        # 构造一个超长历史
+        long_history = [
+            {"role": "user", "content": "x" * 1000},
+            {"role": "assistant", "content": "y" * 1000},
+            {"role": "user", "content": "z" * 1000},
+            {"role": "assistant", "content": "w" * 1000},
+        ]
+        # mock LLM：摘要调用返回摘要文本
+        llm = MagicMock()
+        llm.chat.side_effect = [
+            "这是历史摘要",  # _summarize 调用
+            '{"thought": "t", "action": "final_answer", "action_input": null, "final_answer": "完成"}',  # 主循环
+        ]
+        agent = AgentRuntime(llm, self.registry, max_context_chars=100, keep_recent_messages=2)
+
+        # 直接测试 _maybe_compress
+        compressed = agent._maybe_compress(long_history)
+        self.assertLess(len(compressed), len(long_history))
+        # 第一条是摘要 system 消息
+        self.assertEqual(compressed[0]["role"], "system")
+        self.assertIn("摘要", compressed[0]["content"])
+        # 保留了最近 keep_recent_messages 条
+        self.assertEqual(compressed[-2:], long_history[-2:])
+
+    def test_compress_keeps_tool_results(self):
+        """压缩后应保留最近的工具执行结果（observation）。"""
+        history = [
+            {"role": "user", "content": "旧问题" * 500},
+            {"role": "assistant", "content": "旧回答" * 500},
+            # 最近一轮：工具调用结果
+            {"role": "user", "content": "Observation: 工具 'add' 返回: 42"},
+            {"role": "assistant", "content": '{"action": "final_answer", "final_answer": "..."}'},
+        ]
+        llm = MagicMock()
+        llm.chat.side_effect = ["摘要文本"]
+        agent = AgentRuntime(llm, self.registry, max_context_chars=100, keep_recent_messages=2)
+
+        compressed = agent._maybe_compress(history)
+        # 最近的 observation 消息应被保留
+        contents = [m["content"] for m in compressed]
+        self.assertTrue(any("工具 'add' 返回: 42" in c for c in contents))
+
+    def test_tool_result_in_followup_context(self):
+        """带着工具的追问时，之前的工具结果应正确塞入上下文。"""
+        llm = _make_llm(
+            [
+                # 第一次追问：调用工具
+                '{"thought": "t", "action": "add", "action_input": {"a": 3, "b": 4}, "final_answer": null}',
+                '{"thought": "t", "action": "final_answer", "action_input": null, "final_answer": "结果是7"}',
+                # 第二次追问：直接引用之前结果
+                '{"thought": "t", "action": "final_answer", "action_input": null, "final_answer": "之前算的是7"}',
+            ]
+        )
+        agent = AgentRuntime(llm, self.registry)
+        agent.run("3+4", session_id="s1")
+        agent.run("刚才结果是多少", session_id="s1")
+
+        # 第二次追问时，LLM 收到的上下文应包含之前的工具结果 7
+        third_call_messages = llm.chat.call_args_list[2].kwargs["messages"]
+        contents = [m["content"] for m in third_call_messages]
+        self.assertTrue(any("工具 'add' 返回: 7" in c for c in contents))
+
+    def test_compress_summary_failure_falls_back(self):
+        """摘要生成失败时不应中断流程。"""
+        long_history = [
+            {"role": "user", "content": "x" * 1000},
+            {"role": "assistant", "content": "y" * 1000},
+            {"role": "user", "content": "z" * 1000},
+            {"role": "assistant", "content": "w" * 1000},
+        ]
+        llm = MagicMock()
+        llm.chat.side_effect = Exception("摘要服务不可用")
+        agent = AgentRuntime(llm, self.registry, max_context_chars=100, keep_recent_messages=2)
+
+        compressed = agent._maybe_compress(long_history)
+        # 应退化为截断，不抛异常，且仍保留最近消息
+        self.assertIsNotNone(compressed)
+        self.assertEqual(compressed[-2:], long_history[-2:])
 
 
 if __name__ == "__main__":
