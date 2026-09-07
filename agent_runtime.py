@@ -2,13 +2,21 @@
 
 流程：思考(Thought) -> 行动(Action) -> 观察(Observation)，循环直至产出 final_answer。
 LLM 被要求强制输出 JSON，包含 thought / action / action_input / final_answer 字段。
+
+异常处理分两类：
+- 可恢复错误（工具执行异常，如非法公式、找不到 id）：
+    捕获后转为 "[Tool Error]" 前缀的 observation，追加到 session，让 LLM 自行纠正。
+- 不可恢复错误（LLM API 失效、网络超时、输出乱码）：
+    由 Runtime 层直接 catch，向 Session 写入内部 System Error 消息，
+    向用户返回友好降级提示并终止循环，不把原始错误信息粗暴塞入上下文。
 """
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from llm_client import LLMClient
+from session import Session, SessionManager
 from tool_registry import ToolRegistry
 
 # trace 日志：记录每次工具调用的输入输出
@@ -20,6 +28,25 @@ if not logger.handlers:
         logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     )
     logger.addHandler(_handler)
+
+
+class ToolError(Exception):
+    """可恢复的工具执行错误：应由 LLM 收到反馈后自行纠正。"""
+
+
+class FatalError(Exception):
+    """不可恢复的致命错误：应终止循环并向用户返回降级提示。"""
+
+
+# 同一工具连续报错达到该次数时，注入致歉提示并终止
+MAX_CONSECUTIVE_TOOL_ERRORS = 2
+
+# 友好降级提示文案
+_FALLBACK_MESSAGES = {
+    "llm": "抱歉，系统暂时无法连接服务器，请稍后再试。",
+    "parse": "抱歉，模型暂时无法理解该问题，请换个方式描述后再试。",
+    "unknown": "抱歉，系统出现内部错误，请稍后再试。",
+}
 
 
 # ReAct 系统提示词模板，要求 LLM 强制输出 JSON
@@ -51,16 +78,19 @@ class AgentRuntime:
         llm: LLMClient,
         registry: ToolRegistry,
         max_iterations: int = 10,
+        session_manager: Optional[SessionManager] = None,
     ) -> None:
         """
         参数:
             llm: LLM 客户端实例。
             registry: 工具注册表。
             max_iterations: 最大循环次数，防止死循环。
+            session_manager: 会话管理器；缺省时自动创建，用于多用户窗口隔离。
         """
         self.llm = llm
         self.registry = registry
         self.max_iterations = max_iterations
+        self.session_manager = session_manager or SessionManager()
 
     def _build_system_prompt(self) -> str:
         tools_schema = json.dumps(
@@ -68,66 +98,157 @@ class AgentRuntime:
         )
         return SYSTEM_PROMPT_TEMPLATE.format(tools_schema=tools_schema)
 
-    def run(self, user_query: str) -> str:
+    def run(self, user_query: str, session_id: Optional[str] = None) -> str:
         """执行 ReAct 循环，返回最终答案。
 
         参数:
             user_query: 用户输入。
+            session_id: 可选，会话 ID。传入时从对应 Session 读取历史上下文，
+                        并将本轮对话写回该 Session，实现多用户窗口隔离；
+                        缺省时不持久化（每次独立对话）。
 
         返回:
-            str: 最终答案文本。
+            str: 最终答案文本（含降级提示）。
         """
         system_prompt = self._build_system_prompt()
-        # messages 仅保留 user 初始输入，后续通过 observation 追加 assistant 消息来推进
-        messages: List[Dict[str, str]] = [
-            {"role": "user", "content": user_query}
-        ]
 
-        for iteration in range(1, self.max_iterations + 1):
-            logger.info(f"[Agent] 第 {iteration} 轮思考")
+        # 根据 session_id 获取对应的上下文历史
+        session = None
+        if session_id is not None:
+            session = self.session_manager.get_or_create(session_id)
+            messages = session.get_history()
+            logger.info(f"[Session] 会话 '{session_id}' 已有 {len(messages)} 条历史消息")
+        else:
+            messages = []
 
-            raw = self.llm.chat(messages=messages, system_prompt=system_prompt)
-            logger.info(f"[Agent] LLM 原始输出: {raw}")
+        # 将本轮用户输入追加到消息列表
+        messages.append({"role": "user", "content": user_query})
 
-            parsed = self._parse_output(raw)
+        # 同一工具连续报错计数器
+        last_tool_name: Optional[str] = None
+        consecutive_errors = 0
 
-            # 将本轮 LLM 输出作为 assistant 消息追加，保持上下文连贯
-            messages.append({"role": "assistant", "content": raw})
+        try:
+            for iteration in range(1, self.max_iterations + 1):
+                logger.info(f"[Agent] 第 {iteration} 轮思考")
 
-            action = parsed.get("action", "")
-            thought = parsed.get("thought", "")
-            action_input = parsed.get("action_input")
-            final_answer = parsed.get("final_answer")
-
-            if action == "final_answer":
-                logger.info("[Agent] 产出最终答案")
-                return final_answer or ""
-
-            # 工具调用分支
-            if action:
+                # --- 不可恢复错误：LLM 调用失败（API 失效/网络超时等） ---
                 try:
-                    result = self._execute_tool(action, action_input)
-                    observation = f"工具 '{action}' 返回: {json.dumps(result, ensure_ascii=False, default=str)}"
-                except Exception as exc:  # noqa: BLE001 工具报错需反馈给 LLM
-                    observation = f"工具 '{action}' 执行出错: {type(exc).__name__}: {exc}"
-                    logger.error(f"[Agent] 工具调用失败: {observation}")
-                # 将观察结果作为 user 消息拼接到上下文
-                messages.append({"role": "user", "content": f"Observation: {observation}"})
-            else:
-                # action 为空，提示 LLM 必须给出合法 action
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Observation: 你的输出缺少合法的 action 字段，"
-                            "请重新输出 JSON，且 action 必须是工具名或 'final_answer'。"
-                        ),
-                    }
-                )
+                    raw = self.llm.chat(messages=messages, system_prompt=system_prompt)
+                except Exception as exc:  # noqa: BLE001
+                    raise FatalError(f"LLM 调用失败: {type(exc).__name__}: {exc}") from exc
 
-        # 达到最大循环次数仍未结束
-        logger.warning(f"[Agent] 达到最大循环次数 {self.max_iterations}，强制终止")
-        return "抱歉，我在处理你的问题时超过了最大循环次数，请稍后再试。"
+                logger.info(f"[Agent] LLM 原始输出: {raw}")
+
+                # --- 不可恢复错误：输出无法解析为 JSON ---
+                try:
+                    parsed = self._parse_output(raw)
+                except Exception as exc:  # noqa: BLE001
+                    raise FatalError(f"LLM 输出解析失败: {exc}") from exc
+
+                # 将本轮 LLM 输出作为 assistant 消息追加，保持上下文连贯
+                messages.append({"role": "assistant", "content": raw})
+
+                action = parsed.get("action", "")
+                action_input = parsed.get("action_input")
+                final_answer = parsed.get("final_answer")
+
+                if action == "final_answer":
+                    logger.info("[Agent] 产出最终答案")
+                    answer = final_answer or ""
+                    if session is not None:
+                        session.add_message("user", user_query)
+                        session.add_message("assistant", answer)
+                    return answer
+
+                # --- 工具调用分支 ---
+                if action:
+                    try:
+                        result = self._execute_tool(action, action_input)
+                        observation = f"工具 '{action}' 返回: {json.dumps(result, ensure_ascii=False, default=str)}"
+                        # 工具成功，重置连续报错计数
+                        last_tool_name = None
+                        consecutive_errors = 0
+                    except Exception as exc:  # noqa: BLE001
+                        # 可恢复错误：转为 [Tool Error] observation
+                        observation = self._to_tool_error(action, exc)
+                        logger.error(f"[Agent] 工具调用失败: {observation}")
+
+                        # 记录连续报错次数
+                        if action == last_tool_name:
+                            consecutive_errors += 1
+                        else:
+                            last_tool_name = action
+                            consecutive_errors = 1
+
+                    # 将观察结果作为 user 消息拼接到上下文
+                    messages.append({"role": "user", "content": f"Observation: {observation}"})
+                    # 同步写回 session，确保后续追问能感知刚才的错误
+                    self._sync_session(session, messages)
+
+                    # 同一工具连续报错超阈值：注入致歉提示，让 LLM 产出最终答复
+                    if consecutive_errors >= MAX_CONSECUTIVE_TOOL_ERRORS:
+                        logger.warning(
+                            f"[Agent] 工具 '{action}' 连续报错 {consecutive_errors} 次，"
+                            "注入致歉提示并请求最终答复"
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Observation: 由于工具连续报错，请向用户致歉并请求"
+                                    "换一种方式提问，不要尝试调用该工具了。"
+                                ),
+                            }
+                        )
+                        self._sync_session(session, messages)
+                        # 让 LLM 基于该提示生成最终答复（再执行一轮）
+                        continue
+                else:
+                    # action 为空，提示 LLM 必须给出合法 action
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Observation: 你的输出缺少合法的 action 字段，"
+                                "请重新输出 JSON，且 action 必须是工具名或 'final_answer'。"
+                            ),
+                        }
+                    )
+                    self._sync_session(session, messages)
+
+            # 达到最大循环次数仍未结束
+            logger.warning(f"[Agent] 达到最大循环次数 {self.max_iterations}，强制终止")
+            return "抱歉，我在处理你的问题时超过了最大循环次数，请稍后再试。"
+
+        except FatalError as exc:
+            # 不可恢复错误：Runtime 层统一降级处理
+            logger.error(f"[Fatal] {exc}")
+            fallback = _FALLBACK_MESSAGES.get(self._classify_fatal(exc), _FALLBACK_MESSAGES["unknown"])
+            if session is not None:
+                # 在 Session 中记录一条内部 System Error 消息（不塞原始错误细节）
+                session.add_message("system", "System Error: 处理过程中发生不可恢复错误")
+            return fallback
+
+    @staticmethod
+    def _classify_fatal(exc: FatalError) -> str:
+        """根据致命错误类型返回降级提示的分类键。"""
+        msg = str(exc)
+        if msg.startswith("LLM 调用失败"):
+            return "llm"
+        if msg.startswith("LLM 输出解析失败"):
+            return "parse"
+        return "unknown"
+
+    @staticmethod
+    def _to_tool_error(tool_name: str, exc: Exception) -> str:
+        """将工具异常转化为带 [Tool Error] 前缀的字符串。"""
+        return f"[Tool Error] 工具 '{tool_name}' 执行出错: {type(exc).__name__}: {exc}"
+
+    def _sync_session(self, session: Optional[Session], messages: list) -> None:
+        """将最新 messages 状态同步写回 session。"""
+        if session is not None:
+            session.messages = list(messages)
 
     def _execute_tool(self, tool_name: str, action_input: Any) -> Any:
         """执行工具并记录 trace 日志。"""
