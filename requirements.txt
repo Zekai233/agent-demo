@@ -1,3 +1,4 @@
 openai>=1.40.0
 python-dotenv>=1.0.0
 asteval>=0.9.33
+pytest>=8.0.0
